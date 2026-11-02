@@ -159,11 +159,29 @@ STAGE_TRUTH_COLS = {
 USER_TEMPLATE = "Video metadata:\n{text}"
 
 
+def row_fields(row: pd.Series, cols: list[str]) -> dict[str, str]:
+    """Return the non-empty metadata columns of a row as {name: value}."""
+    return {
+        c: str(row[c]) for c in cols
+        if c in row.index and pd.notna(row[c]) and str(row[c]).strip()
+    }
+
+
 def row_text(row: pd.Series, cols: list[str]) -> str:
     """Concatenate non-empty metadata columns into a labelled prompt input."""
-    return "\n".join(
-        f"{c}: {row[c]}" for c in cols
-        if c in row.index and pd.notna(row[c]) and str(row[c]).strip()
+    return "\n".join(f"{c}: {v}" for c, v in row_fields(row, cols).items())
+
+
+# Jev (discriminative model) answers a true/false question about a structured
+# state rather than generating text, so the single-token reply instruction is
+# replaced with an explicit question. The criteria themselves are unchanged.
+JEV_QUESTION = "Question: should this video be labelled TRUE under the criteria above?"
+
+
+def to_jev_instructions(system_prompt: str) -> str:
+    """Adapt a generative system prompt for use as Jev noul instructions."""
+    return system_prompt.replace(
+        "Reply with a single token: TRUE or FALSE.", JEV_QUESTION
     )
 
 

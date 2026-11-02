@@ -6,19 +6,29 @@ Pass 1 (--stage screen): broad liberal screen — labels TRUE anything that
 Pass 2 (--stage classify): fine-grained classification applied to rows that
     passed the screen. Writes to is_mental_health.
 
-Supports Ollama (local Mac) and vLLM (HPC) backends. Atomic checkpointing
-and full resume support.
+Backends:
+    ollama      local generative LLM (Mac)
+    vllm        self-hosted generative LLM (HPC)
+    openrouter  hosted generative LLM via OpenRouter (needs OPENROUTER_API_KEY)
+    jev         TypeSafe's Jev discriminative model; returns p(TRUE) directly,
+                labelled with --threshold (needs TYPESAFE_API_KEY)
+Atomic checkpointing and full resume support.
 
 Prompts and input formatting live in prompts.py — start there to understand
 or modify the classification criteria.
 
 Model defaults (--model, --model-label) are read from model.env in the repo
-root if present; CLI flags override them.
+root; openrouter and jev read OPENROUTER_MODEL / JEV_MODEL (and the matching
+*_MODEL_LABEL) instead. CLI flags override them.
 
 Local (Mac, Ollama):
     ollama serve
     python classify.py data.parquet --stage screen -v
     python classify.py data.parquet --stage classify -v
+
+Hosted:
+    python classify.py data.parquet --stage screen --backend openrouter --concurrency 32
+    python classify.py data.parquet --stage screen --backend jev --concurrency 32
 
 Evaluation:
     python classify.py data.parquet --stage classify --evaluate ground_truth.csv --rationale
@@ -39,9 +49,14 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from openai import AsyncOpenAI, BadRequestError
+from openai import (
+    AsyncOpenAI, AuthenticationError, BadRequestError, NotFoundError, PermissionDeniedError,
+)
 
-from prompts import STAGE_PROMPTS, STAGE_TRUTH_COLS, USER_TEMPLATE, format_examples, row_text
+from prompts import (
+    STAGE_PROMPTS, STAGE_TRUTH_COLS, USER_TEMPLATE,
+    format_examples, row_fields, row_text, to_jev_instructions,
+)
 
 
 def _load_model_env() -> dict:
@@ -93,8 +108,9 @@ STAGE_OUTPUT_COLS = {
 
 TEMPERATURE = 0
 RATIONALE_MAX_TOKENS = 100  # max new tokens when --rationale is set; label-only uses ~5
+TOP_LOGPROBS = 5            # alternatives requested per token, used for p(TRUE)
 
-# JSON schema used for --rationale mode on both backends.
+# JSON schema used for --rationale mode on all generative backends.
 # Constrains `label` to TRUE/FALSE while leaving `rationale` as a free string.
 RATIONALE_SCHEMA = {
     "type": "object",
@@ -103,6 +119,7 @@ RATIONALE_SCHEMA = {
         "rationale": {"type": "string"},
     },
     "required": ["label", "rationale"],
+    "additionalProperties": False,  # required for strict mode on OpenRouter
 }
 
 # ---------------------------------------------------------------------------
@@ -110,9 +127,17 @@ RATIONALE_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 BACKENDS = {
-    "ollama": {"endpoint": "http://localhost:11434/v1"},
-    "vllm":   {"endpoint": "http://localhost:8000/v1"},
+    "ollama":     {"endpoint": "http://localhost:11434/v1"},
+    "vllm":       {"endpoint": "http://localhost:8000/v1"},
+    "openrouter": {"endpoint": "https://openrouter.ai/api/v1",
+                   "key_env": "OPENROUTER_API_KEY", "env_prefix": "OPENROUTER_"},
+    "jev":        {"endpoint": "https://api.typesafe.ai",
+                   "key_env": "TYPESAFE_API_KEY", "env_prefix": "JEV_"},
 }
+
+# Transient HTTP failures worth retrying with backoff (529 = Jev "overloaded").
+RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504, 529}
+MAX_RETRIES = 6
 
 # ---------------------------------------------------------------------------
 # Output parsing
@@ -154,6 +179,48 @@ def parse_response(raw: str, labels: set[str], with_rationale: bool) -> tuple[st
 # ---------------------------------------------------------------------------
 
 
+async def _post_json(client: httpx.AsyncClient, path: str, body: dict) -> dict:
+    """POST JSON, retrying transient failures with exponential backoff.
+
+    Honours a numeric Retry-After header when the server sends one.
+    """
+    for attempt in range(MAX_RETRIES + 1):
+        retry_after = None
+        try:
+            resp = await client.post(path, json=body)
+        except httpx.TransportError:
+            if attempt == MAX_RETRIES:
+                raise
+        else:
+            if resp.status_code not in RETRY_STATUS or attempt == MAX_RETRIES:
+                resp.raise_for_status()
+                return resp.json()
+            retry_after = resp.headers.get("retry-after")
+        try:
+            delay = float(retry_after)
+        except (TypeError, ValueError):
+            delay = min(2 ** attempt, 60)
+        await asyncio.sleep(delay)
+    raise AssertionError("unreachable")
+
+
+def _is_fatal(exc: BaseException) -> bool:
+    """True for errors that would fail every row (auth, unknown model/endpoint)."""
+    if isinstance(exc, (AuthenticationError, PermissionDeniedError, NotFoundError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {401, 403, 404}
+    return not isinstance(exc, Exception)  # KeyboardInterrupt, CancelledError, etc.
+
+
+def _add_usage(usage: dict, prompt_tokens, completion_tokens, cost=None) -> None:
+    """Accumulate token counts (and OpenRouter's reported cost) for the run."""
+    usage["prompt_tokens"] += prompt_tokens or 0
+    usage["completion_tokens"] += completion_tokens or 0
+    if cost is not None:
+        usage["cost"] += cost
+
+
 async def classify_one_ollama(
     http_client: httpx.AsyncClient,
     text: str,
@@ -181,9 +248,7 @@ async def classify_one_ollama(
     if with_rationale:
         body["format"] = RATIONALE_SCHEMA
     async with sem:
-        resp = await http_client.post("/api/chat", json=body)
-        resp.raise_for_status()
-        data = resp.json()
+        data = await _post_json(http_client, "/api/chat", body)
 
     raw = data.get("message", {}).get("content", "")
     label, rationale = parse_response(raw, set(labels), with_rationale)
@@ -225,10 +290,14 @@ async def classify_one_vllm(
     no_think = {"chat_template_kwargs": {"enable_thinking": False}}
     if with_rationale:
         body["extra_body"] = {"guided_json": RATIONALE_SCHEMA, **no_think}
-    elif not use_legacy[0]:
-        body["extra_body"] = {"structured_outputs": {"choice": labels}, **no_think}
     else:
-        body["extra_body"] = {"guided_choice": labels, **no_think}
+        # The first output token is the label, so its alternatives give p(TRUE)
+        body["logprobs"] = True
+        body["top_logprobs"] = TOP_LOGPROBS
+        if not use_legacy[0]:
+            body["extra_body"] = {"structured_outputs": {"choice": labels}, **no_think}
+        else:
+            body["extra_body"] = {"guided_choice": labels, **no_think}
 
     async with sem:
         try:
@@ -250,14 +319,135 @@ async def classify_one_vllm(
     return label, p, rationale
 
 
+async def classify_one_openrouter(
+    client: AsyncOpenAI,
+    text: str,
+    system_prompt: str,
+    model: str,
+    labels: list[str],
+    with_rationale: bool,
+    disable_thinking: bool,
+    sem: asyncio.Semaphore,
+    usage: dict,
+) -> tuple[str, float | None, str | None]:
+    """Classify a single row via OpenRouter's OpenAI-compatible API.
+
+    Without rationale: short free generation parsed with parse_label, with
+    top logprobs requested so p(TRUE) is available where the provider
+    supports it.
+
+    With rationale: strict JSON schema (RATIONALE_SCHEMA); routing is limited
+    to providers that support structured outputs, so the label stays
+    hard-constrained.
+
+    The system prompt is identical across rows and sent first, so providers
+    with implicit prompt caching bill it at the cached rate after the first
+    request.
+    """
+    body = dict(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": USER_TEMPLATE.format(text=text)},
+        ],
+        temperature=TEMPERATURE,
+    )
+    extra: dict = {"usage": {"include": True}}
+    if disable_thinking:
+        extra["reasoning"] = {"enabled": False}
+
+    if with_rationale:
+        body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "classification", "strict": True,
+                            "schema": RATIONALE_SCHEMA},
+        }
+        extra["provider"] = {"require_parameters": True}
+        max_tok = RATIONALE_MAX_TOKENS
+    else:
+        body["logprobs"] = True
+        body["top_logprobs"] = TOP_LOGPROBS
+        max_tok = max(len(l.split()) for l in labels) + 4
+    # Reasoning tokens count against max_tokens, so only cap when thinking is off
+    if disable_thinking:
+        body["max_tokens"] = max_tok
+
+    async with sem:
+        try:
+            resp = await client.chat.completions.create(**body, extra_body=extra)
+        except BadRequestError as exc:
+            if "context length" in str(exc) or "maximum context" in str(exc):
+                print(f"[WARN] Skipping row: prompt exceeds context limit ({exc})", flush=True)
+                return "TOO_LONG", None, None
+            raise
+
+    if resp.usage:
+        _add_usage(usage, resp.usage.prompt_tokens, resp.usage.completion_tokens,
+                   getattr(resp.usage, "cost", None))
+    raw = (resp.choices[0].message.content or "").strip()
+    label, rationale = parse_response(raw, set(labels), with_rationale)
+    p = None if with_rationale else _prob_true(resp)
+    return label, p, rationale
+
+
+async def classify_one_jev(
+    http_client: httpx.AsyncClient,
+    fields: dict[str, str],
+    instructions: str,
+    model: str,
+    threshold: float,
+    sem: asyncio.Semaphore,
+    usage: dict,
+) -> tuple[str, float | None, str | None]:
+    """Classify a single row with Jev (TypeSafe's discriminative model).
+
+    The metadata fields are sent as a JSON `state` and the stage criteria as
+    the instructions of a single true/false ("noul") question. Jev returns a
+    calibrated p(TRUE) rather than generated text; the label is
+    p >= threshold. Rationales are not available.
+    """
+    body = {
+        "model": model,
+        "state": fields,
+        "questions": {"label": {"type": "noul", "instructions": instructions}},
+    }
+    async with sem:
+        try:
+            data = await _post_json(http_client, "/v1/systemone", body)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 400 and "max_tokens_exceeded" in exc.response.text:
+                print("[WARN] Skipping row: input exceeds Jev context limit", flush=True)
+                return "TOO_LONG", None, None
+            raise
+
+    u = data.get("usage") or {}
+    _add_usage(usage, u.get("input_tokens"), u.get("output_tokens"))
+    p = float(data["answers"]["label"]["noul"])
+    return ("TRUE" if p >= threshold else "FALSE"), p, None
+
+
 def _prob_true(response) -> float | None:
-    """Extract p(TRUE) from the first output token's top logprobs."""
+    """Extract p(TRUE) from the first output token's top logprobs.
+
+    Sums the probability of every alternative that could begin each label
+    (e.g. "TRUE", "True", "TR"), since tokenisers often split or recase the
+    label, and renormalises over the two labels.
+    """
     try:
         top = response.choices[0].logprobs.content[0].top_logprobs
-        probs = {e.token.strip().upper(): math.exp(e.logprob) for e in top}
-        return probs.get("TRUE")
     except (AttributeError, IndexError, TypeError):
         return None
+    p_true = p_false = 0.0
+    for e in top or []:
+        tok = e.token.strip().upper()
+        if not tok:
+            continue
+        if "TRUE".startswith(tok):
+            p_true += math.exp(e.logprob)
+        elif "FALSE".startswith(tok):
+            p_false += math.exp(e.logprob)
+    total = p_true + p_false
+    return p_true / total if total > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -368,19 +558,29 @@ async def classify(args: argparse.Namespace) -> None:
         df[rationale_col] = pd.NA
 
     system_prompt = _build_prompt(args, cols, row_text(df.loc[pending[0]], cols))
+    jev_instructions = to_jev_instructions(system_prompt)
 
     sem = asyncio.Semaphore(args.concurrency)
     use_legacy = [False]  # mutable flag: True after first structured_outputs failure
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "cost": 0.0}
     has_url = "url" in df.columns
     n_pending = len(pending)
 
+    http_client: httpx.AsyncClient | None = None
+    openai_client: AsyncOpenAI | None = None
     if args.backend == "ollama":
         base_url = args.endpoint.replace("/v1", "")
-        http_client: httpx.AsyncClient | None = httpx.AsyncClient(base_url=base_url, timeout=args.timeout)
-        openai_client = None
+        http_client = httpx.AsyncClient(base_url=base_url, timeout=args.timeout)
+    elif args.backend == "jev":
+        http_client = httpx.AsyncClient(
+            base_url=args.endpoint, timeout=args.timeout,
+            headers={"Authorization": f"Bearer {args.api_key}"},
+        )
     else:
-        http_client = None
-        openai_client = AsyncOpenAI(base_url=args.endpoint, api_key="not-needed")
+        openai_client = AsyncOpenAI(
+            base_url=args.endpoint, api_key=args.api_key or "not-needed",
+            timeout=args.timeout, max_retries=MAX_RETRIES,
+        )
 
     n_batches = math.ceil(n_pending / args.batch_size)
     print(f"Classifying {n_pending} rows in {n_batches} batches "
@@ -388,6 +588,7 @@ async def classify(args: argparse.Namespace) -> None:
     print("Sending first batch to server...")
     t0 = time.perf_counter()
     done = 0
+    n_failed = 0
 
     try:
         for i in range(0, n_pending, args.batch_size):
@@ -395,10 +596,25 @@ async def classify(args: argparse.Namespace) -> None:
             tasks = []
             for idx in batch:
                 text = row_text(df.loc[idx], cols)
+                if not text:
+                    # Nothing to classify; don't spend a request on it
+                    df.at[idx, output_col] = "NO_TEXT"
+                    continue
                 if args.backend == "ollama":
                     coro = classify_one_ollama(
                         http_client, text, system_prompt,
                         args.model, labels, with_rationale, sem,
+                    )
+                elif args.backend == "openrouter":
+                    coro = classify_one_openrouter(
+                        openai_client, text, system_prompt,
+                        args.model, labels, with_rationale,
+                        args.disable_thinking, sem, usage,
+                    )
+                elif args.backend == "jev":
+                    coro = classify_one_jev(
+                        http_client, row_fields(df.loc[idx], cols), jev_instructions,
+                        args.model, args.threshold, sem, usage,
                     )
                 else:
                     coro = classify_one_vllm(
@@ -407,16 +623,30 @@ async def classify(args: argparse.Namespace) -> None:
                     )
                 tasks.append((idx, text, coro))
 
-            results = await asyncio.gather(*[coro for _, _, coro in tasks])
+            # A failed row is left empty so the next run retries it, rather
+            # than one bad request discarding the whole batch
+            results = await asyncio.gather(*[coro for _, _, coro in tasks],
+                                           return_exceptions=True)
+            errors = [r for r in results if isinstance(r, BaseException)]
+            for exc in errors:
+                if _is_fatal(exc):
+                    raise exc  # bad API key or model name: stop rather than fail every row
+            n_failed += len(errors)
 
-            for (idx, text, _), (label, p, rationale) in zip(tasks, results):
+            for (idx, text, _), result in zip(tasks, results):
+                if isinstance(result, BaseException):
+                    print(f"[WARN] row {idx} failed, left for resume: "
+                          f"{type(result).__name__}: {result}", flush=True)
+                    continue
+                label, p, rationale = result
                 df.at[idx, output_col] = label
                 df.at[idx, args.prob_col] = p
                 if with_rationale:
                     df.at[idx, rationale_col] = rationale
                 if args.verbose:
                     url = df.loc[idx, "url"] if has_url else ""
-                    print(f"    [{idx}] {label}  {url}")
+                    p_str = f"  p={p:.3f}" if p is not None else ""
+                    print(f"    [{idx}] {label}{p_str}  {url}")
                     print(f"           {text[:80].replace(chr(10), ' ')}…")
                     if rationale:
                         print(f"           rationale: {rationale}")
@@ -432,12 +662,20 @@ async def classify(args: argparse.Namespace) -> None:
     finally:
         if http_client:
             await http_client.aclose()
+        if openai_client:
+            await openai_client.close()
 
     elapsed = time.perf_counter() - t0
     counts = df[output_col].value_counts()
     summary = "  ".join(f"{k}: {v}" for k, v in counts.items() if k != "SKIPPED")
     print(f"\nDone in {elapsed:.1f}s ({n_pending/elapsed:.1f} rows/s)")
     print(f"  {summary}")
+    if n_failed:
+        print(f"  {n_failed} rows failed and were left empty; rerun to retry them")
+    if usage["prompt_tokens"]:
+        cost = f", ${usage['cost']:.4f} reported" if usage["cost"] else ""
+        print(f"  Tokens: {usage['prompt_tokens']:,} in, "
+              f"{usage['completion_tokens']:,} out{cost}")
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +713,14 @@ def _load_ground_truth(
         sys.exit(f"Invalid 'use' values: {invalid_use} (expected 'train' or 'test')")
 
     return gt[gt["use"] == "train"].copy(), gt[gt["use"] == "test"].copy()
+
+
+def _auc(scores: pd.Series, positive: pd.Series) -> float:
+    """ROC AUC as P(score of a positive > score of a negative), ties count half."""
+    pos = scores[positive.values].tolist()
+    neg = scores[~positive.values].tolist()
+    wins = sum((p > n) + 0.5 * (p == n) for p in pos for n in neg)
+    return wins / (len(pos) * len(neg))
 
 
 _EXPERIMENT_LOG = Path("experiment_log.csv")
@@ -570,13 +816,23 @@ async def evaluate(args: argparse.Namespace) -> None:
     else:
         print("\nNo mismatches — perfect accuracy.")
 
+    # Threshold-free view of the scores, where the backend provides them
+    probs = pd.to_numeric(classified[args.prob_col], errors="coerce")
+    scored = probs.notna()
+    if scored.sum() and classified.loc[scored, "ground_truth"].nunique() == 2:
+        auc = _auc(probs[scored], classified.loc[scored, "ground_truth"] == "TRUE")
+        print(f"\nROC AUC from p(TRUE): {auc:.3f} ({scored.sum()} rows with scores)")
+
     eval_csv = Path(args.file).parent / f"eval_results_{args.stage}.csv"
-    save_cols = ["url", output_col, "ground_truth"] + ([rationale_col] if has_rationale else [])
+    save_cols = (["url", output_col, args.prob_col, "ground_truth"]
+                 + ([rationale_col] if has_rationale else []))
     classified[save_cols].to_csv(eval_csv, index=False)
     print(f"\nFull results saved to {eval_csv.name}")
 
     elapsed = time.perf_counter() - eval_start
-    prompt_hash = hashlib.md5(STAGE_PROMPTS[args.stage].encode()).hexdigest()
+    # Hash the prompt template actually used, so --prompt runs are distinguishable
+    template = Path(args.prompt).read_text() if args.prompt else STAGE_PROMPTS[args.stage]
+    prompt_hash = hashlib.md5(template.encode()).hexdigest()
     _log_experiment(args, accuracy, total, tp, tn, fp, fn, elapsed, prompt_hash)
 
 
@@ -594,10 +850,17 @@ def main() -> None:
     p.add_argument("file", help="Parquet file to classify")
     p.add_argument("--stage", choices=["screen", "classify"], required=True,
                    help="'screen': broad first pass; 'classify': fine-grained second pass")
-    p.add_argument("--backend", choices=["ollama", "vllm"], default="ollama",
-                   help="LLM server backend (default: ollama)")
+    p.add_argument("--backend", choices=list(BACKENDS), default="ollama",
+                   help="Model backend (default: ollama)")
     p.add_argument("--endpoint", default=None,
-                   help="Server URL (default: localhost:11434/v1 for ollama, :8000/v1 for vllm)")
+                   help="Server URL (default: localhost:11434/v1 for ollama, :8000/v1 for vllm, "
+                        "the public API for openrouter and jev)")
+    p.add_argument("--model", default=None,
+                   help="Model name; overrides model.env")
+    p.add_argument("--model-label", default=None,
+                   help="Suffix for output columns; overrides model.env")
+    p.add_argument("--threshold", type=float, default=0.5,
+                   help="jev only: label TRUE when p(TRUE) >= this (default: 0.5)")
     p.add_argument("--evaluate", metavar="CSV",
                    help="Evaluate against ground-truth CSV; prints accuracy + confusion matrix")
     p.add_argument("--filter", default=None, metavar="COL=VAL",
@@ -624,11 +887,29 @@ def main() -> None:
     args = p.parse_args()
 
     env = _load_model_env()
-    args.model = env["MODEL"]
-    args.model_label = env["MODEL_LABEL"]
+    backend = BACKENDS[args.backend]
+    prefix = backend.get("env_prefix", "")
+    args.model = args.model or env.get(f"{prefix}MODEL")
+    args.model_label = args.model_label or env.get(f"{prefix}MODEL_LABEL")
+    if not args.model or not args.model_label:
+        sys.exit(f"No model for --backend {args.backend}: set {prefix}MODEL and "
+                 f"{prefix}MODEL_LABEL in model.env, or pass --model and --model-label")
+    args.disable_thinking = env.get("DISABLE_THINKING", "true").lower() == "true"
+
+    args.api_key = None
+    if "key_env" in backend:
+        args.api_key = os.environ.get(backend["key_env"])
+        if not args.api_key:
+            sys.exit(f"--backend {args.backend} needs {backend['key_env']} set in the environment")
+
+    if args.backend == "jev":
+        if args.rationale:
+            sys.exit("--rationale is not available with --backend jev (it returns probabilities, not text)")
+        if [l.upper() for l in args.labels] != LABELS:
+            sys.exit("--backend jev only supports the default TRUE/FALSE labels")
 
     if args.endpoint is None:
-        args.endpoint = BACKENDS[args.backend]["endpoint"]
+        args.endpoint = backend["endpoint"]
     if args.output_col is None:
         args.output_col = STAGE_OUTPUT_COLS[args.stage]
     args.output_col = f"{args.output_col}_{args.model_label}"

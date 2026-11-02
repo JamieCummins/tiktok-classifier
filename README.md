@@ -117,6 +117,38 @@ Model configuration (name, label, quantization, thinking mode) lives in
 `model.env` at the repo root — edit that file to switch models. The PBS
 scripts source it automatically.
 
+### Hosted (OpenRouter or Jev)
+
+No GPU or local server needed. Export the API key in your shell, then pick the
+backend:
+
+```bash
+export OPENROUTER_API_KEY=...   # https://openrouter.ai/keys
+python classify.py ../pipeline-data/02-metadata/tiktok_metadata.parquet --stage screen --backend openrouter --concurrency 32 -v
+python classify.py ../pipeline-data/02-metadata/tiktok_metadata.parquet --stage classify --backend openrouter --concurrency 32 -v
+
+export TYPESAFE_API_KEY=...     # https://console.typesafe.ai/keys
+python classify.py ../pipeline-data/02-metadata/tiktok_metadata.parquet --stage screen --backend jev --concurrency 32 -v
+```
+
+- **`openrouter`** runs the same generative prompts against a hosted model. It
+  reads `OPENROUTER_MODEL` / `OPENROUTER_MODEL_LABEL` from `model.env` (default
+  `qwen/qwen3.6-27b`, the model used on the HPC). Results go in their own
+  columns because the provider's precision may differ from our FP8 weights.
+- **`jev`** sends the metadata to [Jev](https://docs.typesafe.ai/), TypeSafe's
+  discriminative (non-generative) model. The metadata fields go in as a JSON
+  `state`, and the stage prompt's criteria become the instructions of one
+  true/false question (`to_jev_instructions()` in `prompts.py`). Jev returns a
+  calibrated p(TRUE) rather than text, so the label is `p >= --threshold`
+  (default 0.5). `--rationale` is not available. It reads `JEV_MODEL` /
+  `JEV_MODEL_LABEL` (pinned to `jev-1.14.0`, because the `jev-latest` alias
+  moves between versions).
+
+Hosted runs retry rate limits and transient errors with backoff. A row that
+still fails is left empty and picked up on the next run; bad API keys or model
+names stop the run at once. A token count (and OpenRouter's reported cost) is
+printed at the end.
+
 ## Structured and guided decoding
 
 This is the most finicky part of the pipeline.
@@ -138,10 +170,23 @@ The approach to enforcing structured output varies depending on the backend, and
 | vLLM | `--rationale` | `guided_json: RATIONALE_SCHEMA` | `classify_one_vllm` |
 | Ollama | label only | free generation + `parse_label` fallback | `classify_one_ollama` |
 | Ollama | `--rationale` | `format: RATIONALE_SCHEMA` (native Ollama) | `classify_one_ollama` |
+| OpenRouter | label only | free generation + `parse_label` fallback | `classify_one_openrouter` |
+| OpenRouter | `--rationale` | strict `response_format` JSON schema, routed only to providers that support it | `classify_one_openrouter` |
+| Jev | label only | not generative: returns p(TRUE), labelled by `--threshold` | `classify_one_jev` |
 
-Ollama's label-only mode does not use structured decoding (the Ollama OpenAI-compatible
-endpoint does not expose `guided_choice`), but in practice the models we use follow
-the "Reply with a single token" instruction reliably on label-only prompts.
+Ollama's and OpenRouter's label-only modes do not use structured decoding (neither
+exposes a choice constraint), but in practice the models we use follow
+the "Reply with a single token" instruction reliably on label-only prompts. Any
+stray output shows up as `UNKNOWN`.
+
+### p(TRUE) scores
+
+In label-only mode, vLLM and OpenRouter requests also ask for the top logprobs
+of the first output token. `_prob_true()` adds up every alternative that could
+start each label ("TRUE", "True", "TR", ...) and renormalises over the two
+labels. The result goes in `prob_true_<model>`. Jev fills the same column with
+its own probability. Evaluation reports ROC AUC from these scores, which shows
+how well the model ranks videos regardless of where the cutoff sits.
 
 ### RATIONALE_SCHEMA
 
@@ -213,8 +258,12 @@ python classify.py ../pipeline-data/02-metadata/tiktok_metadata.parquet \
   --rationale --concurrency 2 -v
 ```
 
-Prints accuracy, confusion matrix, and mismatches. Full results are saved to
-`eval_results_classify.csv`. Metrics are appended to `experiment_log.csv`.
+Prints accuracy, confusion matrix, mismatches, and ROC AUC when p(TRUE) scores are
+available. Full results are saved to `eval_results_classify.csv`. Metrics are
+appended to `experiment_log.csv`.
+
+Add `--backend openrouter` or `--backend jev` (dropping `--rationale` for Jev)
+to compare hosted models on the same held-out rows.
 
 ### IMHI benchmark
 
@@ -236,8 +285,11 @@ python classify.py ../pipeline-data/02-metadata/tiktok_metadata.parquet \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--stage` | required | `screen` or `classify` |
-| `--backend` | `ollama` | `ollama` or `vllm` |
+| `--backend` | `ollama` | `ollama`, `vllm`, `openrouter` or `jev` |
 | `--endpoint` | backend-specific | Server URL (model is set via `model.env`) |
+| `--model` | `model.env` | Override the model name |
+| `--model-label` | `model.env` | Override the output-column suffix |
+| `--threshold P` | `0.5` | `jev` only: label TRUE when p(TRUE) >= P |
 | `--evaluate CSV` | — | Evaluate against ground-truth CSV; prints accuracy + confusion matrix |
 | `--filter COL=VAL` | — | Only classify rows where column matches value |
 | `--rationale` | off | Request a one-sentence explanation alongside each label |
@@ -255,6 +307,10 @@ Column names are suffixed with the model label to support multi-model comparison
 
 | Column | Stage | Values |
 |--------|-------|--------|
-| `is_mental_health_broad_<model>` | screen | `TRUE`, `FALSE`, `SKIPPED`, `UNKNOWN` |
-| `is_mental_health_<model>` | classify | `TRUE`, `FALSE`, `SKIPPED`, `UNKNOWN` |
+| `is_mental_health_broad_<model>` | screen | `TRUE`, `FALSE`, `SKIPPED`, `UNKNOWN`, `NO_TEXT`, `TOO_LONG` |
+| `is_mental_health_<model>` | classify | `TRUE`, `FALSE`, `SKIPPED`, `UNKNOWN`, `NO_TEXT`, `TOO_LONG` |
 | `is_mental_health_<model>_rationale` | classify + `--rationale` | one-sentence explanation |
+| `prob_true_<model>` | both | p(TRUE) where the backend provides it (not Ollama, not `--rationale`) |
+
+`NO_TEXT` marks rows with no description, transcript or suggested words; no
+request is sent for them.
