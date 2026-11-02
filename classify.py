@@ -752,6 +752,90 @@ def _log_experiment(args, accuracy, total, tp, tn, fp, fn, elapsed, prompt_hash)
     print(f"\nLogged to {_EXPERIMENT_LOG}")
 
 
+def _stage_args(args: argparse.Namespace, stage: str) -> argparse.Namespace:
+    """Return a copy of args with the stage-specific output, p(TRUE) and filter set.
+
+    Each stage gets its own p(TRUE) column so the classify pass doesn't
+    overwrite the screen pass's scores.
+    """
+    a = argparse.Namespace(**vars(args))
+    a.stage = stage
+    base = args.output_col or STAGE_OUTPUT_COLS[stage]
+    a.output_col = f"{base}_{args.model_label}"
+    a.prob_col = f"prob_true{'_broad' if stage == 'screen' else ''}_{args.model_label}"
+    if a.filter is None and stage == "classify":
+        a.filter = f"{STAGE_OUTPUT_COLS['screen']}_{args.model_label}=TRUE"
+    return a
+
+
+def _report(df: pd.DataFrame, pred_col: str, prob_col: str | None,
+            rationale_col: str | None, title: str) -> tuple[int, int, int, int, int]:
+    """Print accuracy, confusion matrix, mismatches and AUC for rows already
+    restricted to TRUE/FALSE predictions; return (total, tp, tn, fp, fn)."""
+    pred, truth = df[pred_col], df["ground_truth"]
+    total = len(df)
+    tp = int(((pred == "TRUE")  & (truth == "TRUE")).sum())
+    tn = int(((pred == "FALSE") & (truth == "FALSE")).sum())
+    fp = int(((pred == "TRUE")  & (truth == "FALSE")).sum())
+    fn = int(((pred == "FALSE") & (truth == "TRUE")).sum())
+
+    print(f"\n{'='*60}")
+    print(f"{title} ({total} test rows)")
+    print(f"{'='*60}")
+    print(f"Accuracy: {tp+tn}/{total} ({(tp+tn)/total:.1%})")
+    if tp + fp:
+        print(f"Precision: {tp/(tp+fp):.3f}", end="  ")
+    if tp + fn:
+        print(f"Recall: {tp/(tp+fn):.3f}", end="")
+    print("\n\nConfusion matrix (rows = predicted, cols = ground truth):")
+    ct = pd.crosstab(pred, truth, rownames=["predicted"], colnames=["actual"])
+    print(ct.to_string())
+
+    mismatches = df[pred != truth]
+    if not mismatches.empty:
+        print(f"\nMismatches ({len(mismatches)}):")
+        for _, row in mismatches.iterrows():
+            print(f"  {row['url']}")
+            print(f"    predicted={row[pred_col]}  truth={row['ground_truth']}")
+            if rationale_col and rationale_col in df.columns and pd.notna(row.get(rationale_col)):
+                print(f"    rationale: {row[rationale_col]}")
+    else:
+        print("\nNo mismatches — perfect accuracy.")
+
+    # Threshold-free view of the scores, where the backend provides them
+    if prob_col and prob_col in df.columns:
+        probs = pd.to_numeric(df[prob_col], errors="coerce")
+        scored = probs.notna()
+        if scored.sum() and truth[scored].nunique() == 2:
+            auc = _auc(probs[scored], truth[scored] == "TRUE")
+            print(f"\nROC AUC from p(TRUE): {auc:.3f} ({scored.sum()} rows with scores)")
+
+    return total, tp, tn, fp, fn
+
+
+def _prompt_hash(args: argparse.Namespace, stages: list[str]) -> str:
+    """Hash the prompt template(s) actually used, so --prompt runs are distinguishable."""
+    if args.prompt:
+        template = Path(args.prompt).read_text()
+    else:
+        template = "".join(STAGE_PROMPTS[s] for s in stages)
+    return hashlib.md5(template.encode()).hexdigest()
+
+
+async def _run_on_test_rows(args: argparse.Namespace, test_df: pd.DataFrame,
+                            stage_args: list[argparse.Namespace]) -> pd.DataFrame:
+    """Classify the test rows through each stage in turn and return the results."""
+    tmp_path = Path(args.file).parent / ".eval_tmp.parquet"
+    try:
+        test_df.to_parquet(tmp_path, index=False)
+        for a in stage_args:
+            a.file = str(tmp_path)
+            await classify(a)
+        return pd.read_parquet(tmp_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 async def evaluate(args: argparse.Namespace) -> None:
     """Classify ground-truth test rows and compare predictions to labels."""
     eval_start = time.perf_counter()
@@ -763,21 +847,8 @@ async def evaluate(args: argparse.Namespace) -> None:
     if test_df.empty:
         sys.exit("No rows with use=test in the CSV.")
 
-    subset = test_df.copy()
-    for col in ([output_col, "prob_true"] + ([f"{output_col}_rationale"] if args.rationale else [])):
-        subset[col] = pd.NA
-
-    print(f"Evaluating {len(subset)} test rows from {csv_path.name}")
-
-    tmp_path = Path(args.file).parent / ".eval_tmp.parquet"
-    try:
-        subset.to_parquet(tmp_path, index=False)
-        eval_args = argparse.Namespace(**vars(args))
-        eval_args.file = str(tmp_path)
-        await classify(eval_args)
-        result = pd.read_parquet(tmp_path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    print(f"Evaluating {len(test_df)} test rows from {csv_path.name}")
+    result = await _run_on_test_rows(args, test_df, [args])
 
     truth = dict(zip(test_df["url"], test_df[label_col]))
     result["ground_truth"] = result["url"].map(truth)
@@ -787,53 +858,84 @@ async def evaluate(args: argparse.Namespace) -> None:
         print("No rows were classified (all UNKNOWN or SKIPPED).")
         return
 
-    total = len(classified)
-    tp = ((classified[output_col] == "TRUE")  & (classified["ground_truth"] == "TRUE")).sum()
-    tn = ((classified[output_col] == "FALSE") & (classified["ground_truth"] == "FALSE")).sum()
-    fp = ((classified[output_col] == "TRUE")  & (classified["ground_truth"] == "FALSE")).sum()
-    fn = ((classified[output_col] == "FALSE") & (classified["ground_truth"] == "TRUE")).sum()
-    accuracy = (tp + tn) / total
-
-    print(f"\n{'='*60}")
-    print(f"Evaluation results ({total} test rows)")
-    print(f"{'='*60}")
-    print(f"Accuracy: {tp+tn}/{total} ({accuracy:.1%})\n")
-    print("Confusion matrix (rows = predicted, cols = ground truth):")
-    ct = pd.crosstab(classified[output_col], classified["ground_truth"],
-                     rownames=["predicted"], colnames=["actual"])
-    print(ct.to_string())
-
     rationale_col = f"{output_col}_rationale"
-    has_rationale = rationale_col in result.columns
-    mismatches = classified[classified[output_col] != classified["ground_truth"]]
-    if not mismatches.empty:
-        print(f"\nMismatches ({len(mismatches)}):")
-        for _, row in mismatches.iterrows():
-            print(f"  {row['url']}")
-            print(f"    predicted={row[output_col]}  truth={row['ground_truth']}")
-            if has_rationale and pd.notna(row.get(rationale_col)):
-                print(f"    rationale: {row[rationale_col]}")
-    else:
-        print("\nNo mismatches — perfect accuracy.")
-
-    # Threshold-free view of the scores, where the backend provides them
-    probs = pd.to_numeric(classified[args.prob_col], errors="coerce")
-    scored = probs.notna()
-    if scored.sum() and classified.loc[scored, "ground_truth"].nunique() == 2:
-        auc = _auc(probs[scored], classified.loc[scored, "ground_truth"] == "TRUE")
-        print(f"\nROC AUC from p(TRUE): {auc:.3f} ({scored.sum()} rows with scores)")
+    total, tp, tn, fp, fn = _report(classified, output_col, args.prob_col,
+                                    rationale_col, "Evaluation results")
 
     eval_csv = Path(args.file).parent / f"eval_results_{args.stage}.csv"
     save_cols = (["url", output_col, args.prob_col, "ground_truth"]
-                 + ([rationale_col] if has_rationale else []))
+                 + ([rationale_col] if rationale_col in classified.columns else []))
     classified[save_cols].to_csv(eval_csv, index=False)
     print(f"\nFull results saved to {eval_csv.name}")
 
     elapsed = time.perf_counter() - eval_start
-    # Hash the prompt template actually used, so --prompt runs are distinguishable
-    template = Path(args.prompt).read_text() if args.prompt else STAGE_PROMPTS[args.stage]
-    prompt_hash = hashlib.md5(template.encode()).hexdigest()
-    _log_experiment(args, accuracy, total, tp, tn, fp, fn, elapsed, prompt_hash)
+    _log_experiment(args, (tp + tn) / total, total, tp, tn, fp, fn, elapsed,
+                    _prompt_hash(args, [args.stage]))
+
+
+async def evaluate_pipeline(args: argparse.Namespace) -> None:
+    """Run screen then classify on the test rows and score the final label.
+
+    The per-stage evaluations score each pass in isolation (the classify pass
+    sees only rows a human marked as passing the screen). This scores what the
+    pipeline actually produces: a row the screen rejects is final FALSE, a row
+    it passes takes the classify label. Truth is is_mental_health_handcoded.
+    """
+    eval_start = time.perf_counter()
+    csv_path = Path(args.evaluate)
+    label_col = STAGE_TRUTH_COLS["classify"]
+
+    _, test_df = _load_ground_truth(csv_path, label_col)
+    if test_df.empty:
+        sys.exit("No rows with use=test in the CSV.")
+
+    screen = _stage_args(args, "screen")
+    screen.rationale = False  # --rationale explains classify decisions; keep the screen's p(TRUE)
+    clf = _stage_args(args, "classify")  # filter defaults to the screen's TRUE rows
+    print(f"Evaluating the full pipeline on {len(test_df)} test rows from {csv_path.name}")
+    result = await _run_on_test_rows(args, test_df, [screen, clf])
+
+    s, c = result[screen.output_col], result[clf.output_col]
+    final = pd.Series(pd.NA, index=result.index, dtype="object")
+    final[s == "FALSE"] = "FALSE"
+    passed = s == "TRUE"
+    final[passed & c.isin({"TRUE", "FALSE"})] = c[passed & c.isin({"TRUE", "FALSE"})]
+    result["final"] = final
+    result["ground_truth"] = result[label_col]
+
+    unscored = result["final"].isna()
+    if unscored.any():
+        print(f"\n{unscored.sum()} rows have no final label (UNKNOWN, NO_TEXT, TOO_LONG "
+              f"or failed in either pass) and are excluded from scoring")
+    scored = result[~unscored].copy()
+    if scored.empty:
+        print("No rows were classified.")
+        return
+
+    total, tp, tn, fp, fn = _report(scored, "final", None, f"{clf.output_col}_rationale",
+                                    "End-to-end pipeline results")
+
+    # Where the errors come from: the screen can only lose true positives;
+    # anything else is the classify pass
+    dropped = scored[(scored[screen.output_col] == "FALSE") & (scored["ground_truth"] == "TRUE")]
+    n_true = int((scored["ground_truth"] == "TRUE").sum())
+    print(f"\nScreen pass: {int((scored[screen.output_col] == 'TRUE').sum())}/{total} rows passed")
+    print(f"  Mental-health videos lost at the screen: {len(dropped)}/{n_true}"
+          f"{' (' + ', '.join(dropped['url']) + ')' if len(dropped) else ''}")
+    print(f"  Errors from the classify pass: {fp + fn - len(dropped)}")
+
+    eval_csv = Path(args.file).parent / "eval_results_pipeline.csv"
+    save_cols = [c for c in ["url", screen.output_col, screen.prob_col, clf.output_col,
+                             clf.prob_col, "final", "ground_truth",
+                             f"{clf.output_col}_rationale"] if c in scored.columns]
+    scored[save_cols].to_csv(eval_csv, index=False)
+    print(f"\nFull results saved to {eval_csv.name}")
+
+    elapsed = time.perf_counter() - eval_start
+    log_args = argparse.Namespace(**vars(args))
+    log_args.stage = "pipeline"
+    _log_experiment(log_args, (tp + tn) / total, total, tp, tn, fp, fn, elapsed,
+                    _prompt_hash(args, ["screen", "classify"]))
 
 
 # ---------------------------------------------------------------------------
@@ -848,8 +950,9 @@ def main() -> None:
     )
 
     p.add_argument("file", help="Parquet file to classify")
-    p.add_argument("--stage", choices=["screen", "classify"], required=True,
-                   help="'screen': broad first pass; 'classify': fine-grained second pass")
+    p.add_argument("--stage", choices=["screen", "classify", "pipeline"], required=True,
+                   help="'screen': broad first pass; 'classify': fine-grained second pass; "
+                        "'pipeline': with --evaluate, run both passes and score the final label")
     p.add_argument("--backend", choices=list(BACKENDS), default="ollama",
                    help="Model backend (default: ollama)")
     p.add_argument("--endpoint", default=None,
@@ -910,13 +1013,16 @@ def main() -> None:
 
     if args.endpoint is None:
         args.endpoint = backend["endpoint"]
-    if args.output_col is None:
-        args.output_col = STAGE_OUTPUT_COLS[args.stage]
-    args.output_col = f"{args.output_col}_{args.model_label}"
-    args.prob_col = f"prob_true_{args.model_label}"
-    if args.filter is None and args.stage == "classify":
-        args.filter = f"is_mental_health_broad_{args.model_label}=TRUE"
 
+    if args.stage == "pipeline":
+        if not args.evaluate:
+            sys.exit("--stage pipeline is evaluation-only; pass --evaluate CSV")
+        if args.filter or args.output_col or args.prompt:
+            sys.exit("--filter, --output-col and --prompt can't be used with --stage pipeline")
+        asyncio.run(evaluate_pipeline(args))
+        return
+
+    args = _stage_args(args, args.stage)
     if args.evaluate:
         asyncio.run(evaluate(args))
     else:

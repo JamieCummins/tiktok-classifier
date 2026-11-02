@@ -184,7 +184,8 @@ stray output shows up as `UNKNOWN`.
 In label-only mode, vLLM and OpenRouter requests also ask for the top logprobs
 of the first output token. `_prob_true()` adds up every alternative that could
 start each label ("TRUE", "True", "TR", ...) and renormalises over the two
-labels. The result goes in `prob_true_<model>`. Jev fills the same column with
+labels. The result goes in `prob_true_broad_<model>` (screen) or
+`prob_true_<model>` (classify). Jev fills the same columns with
 its own probability. Evaluation reports ROC AUC from these scores, which shows
 how well the model ranks videos regardless of where the cutoff sits.
 
@@ -265,6 +266,27 @@ appended to `experiment_log.csv`.
 Add `--backend openrouter` or `--backend jev` (dropping `--rationale` for Jev)
 to compare hosted models on the same held-out rows.
 
+### End-to-end (both passes)
+
+The per-stage evaluations score each pass in isolation: the classify evaluation
+only sees rows a human marked as passing the screen, so videos the model's
+screen wrongly drops never count against it. `--stage pipeline` scores what the
+pipeline actually produces:
+
+```bash
+python classify.py ../pipeline-data/02-metadata/tiktok_metadata.parquet \
+  --stage pipeline \
+  --evaluate ../pipeline-data/03-handcoded/handcoded_examples.csv -v
+```
+
+It runs the screen on the test rows, then the classify pass on those the screen
+let through. A row the screen rejects is final `FALSE`; otherwise it takes the
+classify label. The final label is scored against `is_mental_health_handcoded`,
+and the errors are split into mental-health videos lost at the screen (listed
+by URL) and errors made by the classify pass. `--rationale` applies to the
+classify pass only. Results go to `eval_results_pipeline.csv` and the run is
+logged with `stage=pipeline`.
+
 ### IMHI benchmark
 
 `prepare_imhi_eval.py` converts the [IMHI dataset](https://huggingface.co/datasets/Tianlin668/IMHI)
@@ -284,7 +306,7 @@ python classify.py ../pipeline-data/02-metadata/tiktok_metadata.parquet \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--stage` | required | `screen` or `classify` |
+| `--stage` | required | `screen`, `classify`, or `pipeline` (with `--evaluate` only) |
 | `--backend` | `ollama` | `ollama`, `vllm`, `openrouter` or `jev` |
 | `--endpoint` | backend-specific | Server URL (model is set via `model.env`) |
 | `--model` | `model.env` | Override the model name |
@@ -310,7 +332,8 @@ Column names are suffixed with the model label to support multi-model comparison
 | `is_mental_health_broad_<model>` | screen | `TRUE`, `FALSE`, `SKIPPED`, `UNKNOWN`, `NO_TEXT`, `TOO_LONG` |
 | `is_mental_health_<model>` | classify | `TRUE`, `FALSE`, `SKIPPED`, `UNKNOWN`, `NO_TEXT`, `TOO_LONG` |
 | `is_mental_health_<model>_rationale` | classify + `--rationale` | one-sentence explanation |
-| `prob_true_<model>` | both | p(TRUE) where the backend provides it (not Ollama, not `--rationale`) |
+| `prob_true_broad_<model>` | screen | p(TRUE) where the backend provides it (not Ollama, not `--rationale`) |
+| `prob_true_<model>` | classify | as above |
 
 `NO_TEXT` marks rows with no description, transcript or suggested words; no
 request is sent for them.
